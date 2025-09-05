@@ -1,359 +1,330 @@
+# anchorcomply_prototype.py
 import streamlit as st
 import pandas as pd
-import numpy as np
-from datetime import datetime, timedelta
-from reportlab.lib.pagesizes import letter
-from reportlab.platypus import SimpleDocTemplate, Paragraph, Spacer, Table, TableStyle, PageBreak
-from reportlab.lib.styles import getSampleStyleSheet, ParagraphStyle
-from reportlab.lib.units import inch
-from reportlab.lib import colors
-import io
-import base64
+from datetime import datetime, date
 from dateutil.relativedelta import relativedelta
+from io import BytesIO
+from difflib import get_close_matches
+import re
+from fpdf import FPDF
 
-# Page config
-st.set_page_config(page_title="AnchorComply Prototype", page_icon="📊", layout="wide")
+st.set_page_config(page_title="AnchorComply Prototype", layout="wide")
 
-# App title and description
-st.title("📊 AnchorComply Prototype")
-st.markdown("Quick compliance checks for GST/GSTR filings with PDF reporting")
+st.title("AnchorComply — Prototype Audit Assistant")
+st.markdown("Upload CSVs (sales invoices, GSTR-1, GSTR-3B). Prototype flags: invoice mismatch, duplicates, delayed filings. Use mapping UI if headers differ.")
 
-# Initialize session state
-if 'invoice_data' not in st.session_state:
-    st.session_state.invoice_data = None
-if 'gstr1_data' not in st.session_state:
-    st.session_state.gstr1_data = None
-if 'gstr3b_data' not in st.session_state:
-    st.session_state.gstr3b_data = None
-if 'mapping_config' not in st.session_state:
-    st.session_state.mapping_config = {}
+# -----------------------
+# Helper functions
+# -----------------------
+def norm_col(c):
+    return re.sub(r'[^a-z0-9]', '', c.lower())
 
-# Sample data for testing
-def create_sample_data():
-    sample_invoices = pd.DataFrame({
-        'invoice_no': ['INV-001', 'INV-002', 'INV-003', 'INV-004'],
-        'invoice_date': ['2024-01-15', '2024-01-16', '2024-01-17', '2024-01-18'],
-        'customer_gstin': ['29ABCDE1234F1Z5', '27FGHIJ5678K9L0', '06MNOPQ9012R3S4', ''],
-        'taxable_value': [10000, 15000, 20000, 5000],
-        'igst': [1800, 2700, 3600, 0],
-        'cgst': [0, 0, 0, 450],
-        'sgst': [0, 0, 0, 450],
-        'total_amount': [11800, 17700, 23600, 5900]
-    })
-    
-    sample_gstr1 = pd.DataFrame({
-        'invoice_number': ['INV-001', 'INV-002', 'INV-005'],
-        'invoice_date': ['2024-01-15', '2024-01-16', '2024-01-20'],
-        'gstin': ['29ABCDE1234F1Z5', '27FGHIJ5678K9L0', '32STUVW3456X7Y8'],
-        'taxable_value': [10000, 15000, 25000],
-        'igst': [1800, 2700, 4500],
-        'total_value': [11800, 17700, 29500]
-    })
-    
-    sample_gstr3b = pd.DataFrame({
-        'month': ['Jan-2024', 'Jan-2024', 'Jan-2024'],
-        'gstin': ['29ABCDE1234F1Z5', '27FGHIJ5678K9L0', '32STUVW3456X7Y8'],
-        'tax_paid': [1800, 2700, 4500],
-        'filing_date': ['2024-02-20', '2024-02-21', '2024-02-22']
-    })
-    
-    return sample_invoices, sample_gstr1, sample_gstr3b
-
-# File upload section
-st.sidebar.header("📁 Upload Files")
-st.sidebar.info("Upload your invoice data, GSTR-1, and GSTR-3B files")
-
-uploaded_invoices = st.sidebar.file_uploader("Invoice Data (CSV/XLSX)", type=['csv', 'xlsx'])
-uploaded_gstr1 = st.sidebar.file_uploader("GSTR-1 Data (CSV/XLSX)", type=['csv', 'xlsx'])
-uploaded_gstr3b = st.sidebar.file_uploader("GSTR-3B Data (CSV/XLSX)", type=['csv', 'xlsx'])
-
-# Load sample data button
-if st.sidebar.button("Use Sample Data"):
-    invoices, gstr1, gstr3b = create_sample_data()
-    st.session_state.invoice_data = invoices
-    st.session_state.gstr1_data = gstr1
-    st.session_state.gstr3b_data = gstr3b
-    st.sidebar.success("Sample data loaded!")
-
-# Load uploaded files
-def load_data(uploaded_file):
-    if uploaded_file is not None:
-        try:
-            if uploaded_file.name.endswith('.csv'):
-                return pd.read_csv(uploaded_file)
-            elif uploaded_file.name.endswith('.xlsx'):
-                return pd.read_excel(uploaded_file, engine='openpyxl')
-        except Exception as e:
-            st.error(f"Error loading file: {e}")
-            return None
+def fuzzy_match(columns, candidates, cutoff=0.6):
+    cols_norm = {norm_col(c): c for c in columns}
+    norm_map = list(cols_norm.keys())
+    for cand in candidates:
+        matches = get_close_matches(norm_col(cand), norm_map, n=1, cutoff=cutoff)
+        if matches:
+            return cols_norm[matches[0]]
     return None
 
-if uploaded_invoices:
-    st.session_state.invoice_data = load_data(uploaded_invoices)
-if uploaded_gstr1:
-    st.session_state.gstr1_data = load_data(uploaded_gstr1)
-if uploaded_gstr3b:
-    st.session_state.gstr3b_data = load_data(uploaded_gstr3b)
+def to_num(s):
+    if pd.isna(s): return 0.0
+    if isinstance(s, (int, float)): return float(s)
+    try:
+        s = str(s).replace(',', '').replace('(', '-').replace(')', '').strip()
+        return float(s) if s!='' else 0.0
+    except:
+        return 0.0
 
-# Column mapping UI
-def show_mapping_ui(df, df_name):
-    st.subheader(f"Column Mapping for {df_name}")
-    
-    if df is not None:
-        st.write("Detected columns:", list(df.columns))
-        
-        mapping = {}
-        required_fields = {
-            'invoice_data': ['invoice_no', 'invoice_date', 'customer_gstin', 'taxable_value', 'total_amount'],
-            'gstr1_data': ['invoice_number', 'invoice_date', 'gstin', 'taxable_value', 'total_value'],
-            'gstr3b_data': ['month', 'gstin', 'tax_paid', 'filing_date']
-        }
-        
-        for field in required_fields[df_name]:
-            options = [''] + list(df.columns)
-            default_index = 0
-            if field in df.columns:
-                default_index = options.index(field) + 1
-            mapping[field] = st.selectbox(
-                f"Map to '{field}'", 
-                options=options,
-                index=default_index,
-                key=f"{df_name}_{field}"
-            )
-        
-        return mapping
-    return {}
+def parse_date_series(s):
+    try:
+        return pd.to_datetime(s, dayfirst=False, errors='coerce').dt.date
+    except:
+        return pd.to_datetime(s, errors='coerce').dt.date
 
-# Show mapping UIs if data is loaded
-if st.session_state.invoice_data is not None:
-    st.session_state.mapping_config['invoice_data'] = show_mapping_ui(
-        st.session_state.invoice_data, 'invoice_data'
-    )
-
-if st.session_state.gstr1_data is not None:
-    st.session_state.mapping_config['gstr1_data'] = show_mapping_ui(
-        st.session_state.gstr1_data, 'gstr1_data'
-    )
-
-if st.session_state.gstr3b_data is not None:
-    st.session_state.mapping_config['gstr3b_data'] = show_mapping_ui(
-        st.session_state.gstr3b_data, 'gstr3b_data'
-    )
-
-# Apply mapping to data
-def apply_mapping(df, mapping):
-    if df is None:
+# robust file reader
+def read_any(fileobj):
+    if fileobj is None: return None
+    try:
+        name = getattr(fileobj, "name", "")
+        fileobj.seek(0)
+        if name.lower().endswith(".xlsx"):
+            return pd.read_excel(fileobj, dtype=str)
+        else:
+            # try default csv read (handles most)
+            fileobj.seek(0)
+            txt = fileobj.read()
+            # streamlit gives bytes; handle that
+            if isinstance(txt, bytes):
+                b = BytesIO(txt)
+                try:
+                    return pd.read_csv(b, dtype=str)
+                except:
+                    b.seek(0)
+                    return pd.read_csv(b, sep=';', dtype=str, engine='python')
+            else:
+                return pd.read_csv(BytesIO(txt.encode('utf-8')), dtype=str)
+    except Exception as e:
+        st.sidebar.error(f"Read failed: {e}")
         return None
-    
-    mapped_df = df.copy()
-    for target_col, source_col in mapping.items():
-        if source_col and source_col in df.columns:
-            mapped_df[target_col] = df[source_col]
-        elif source_col:
-            mapped_df[target_col] = None
-    
-    # Keep only mapped columns
-    keep_cols = [col for col in mapping.values() if col]
-    return mapped_df[keep_cols] if keep_cols else None
 
-# Audit functions
-def find_mismatched_invoices(invoices, gstr1):
-    if invoices is None or gstr1 is None:
-        return pd.DataFrame()
-    
-    # Find invoices not in GSTR-1
-    merged = invoices.merge(gstr1, left_on='invoice_no', right_on='invoice_number', how='left', indicator=True)
-    mismatched = merged[merged['_merge'] == 'left_only']
-    
-    return mismatched
+# -----------------------
+# Upload & Mapping UI
+# -----------------------
+st.sidebar.header("Upload & Map Files")
+sales_file = st.sidebar.file_uploader("Upload sales / invoices (CSV or XLSX)", type=["csv","xlsx"])
+gstr1_file = st.sidebar.file_uploader("Upload GSTR-1 (optional)", type=["csv","xlsx"])
+gstr3b_file = st.sidebar.file_uploader("Upload GSTR-3B (optional)", type=["csv","xlsx"])
 
-def find_duplicate_invoices(invoices):
-    if invoices is None:
-        return pd.DataFrame()
-    
-    duplicates = invoices[invoices.duplicated(subset=['invoice_no'], keep=False)]
-    return duplicates
+sales_df_raw = read_any(sales_file)
+gstr1_df_raw = read_any(gstr1_file)
+gstr3b_df_raw = read_any(gstr3b_file)
 
-def calculate_late_fees(gstr3b, filing_deadline_day=20):
-    if gstr3b is None:
-        return pd.DataFrame()
-    
-    gstr3b = gstr3b.copy()
-    gstr3b['filing_date'] = pd.to_datetime(gstr3b['filing_date'])
-    gstr3b['month'] = pd.to_datetime(gstr3b['month'])
-    
-    gstr3b['deadline_date'] = gstr3b['month'] + pd.offsets.MonthEnd(0)
-    gstr3b['deadline_date'] = gstr3b['deadline_date'].apply(
-        lambda x: x.replace(day=filing_deadline_day)
-    )
-    
-    gstr3b['days_late'] = (gstr3b['filing_date'] - gstr3b['deadline_date']).dt.days
-    gstr3b['days_late'] = gstr3b['days_late'].apply(lambda x: max(0, x))
-    
-    gstr3b['late_fee'] = gstr3b['days_late'].apply(
-        lambda x: min(5000, max(100, x * 50))  # Simplified late fee calculation
-    )
-    
-    return gstr3b
+def show_map_ui(df, name, required_fields):
+    if df is None:
+        st.sidebar.info(f"Upload {name} to map columns")
+        return None
+    st.sidebar.markdown(f"**{name} - Column mapping**")
+    cols = list(df.columns)
+    mapping = {}
+    for field, label in required_fields.items():
+        candidates = label if isinstance(label, list) else [label]
+        auto = None
+        for cand in candidates:
+            auto = fuzzy_match(cols, candidates)
+        mapping[field] = st.sidebar.selectbox(f"Map '{field}'", options=[""]+cols, index=(cols.index(auto)+1 if auto else 0))
+    st.sidebar.write(df.head(3))
+    return mapping
 
-# Run audit button
-if st.button("🚀 Run Compliance Audit", type="primary"):
-    if (st.session_state.invoice_data is not None and 
-        st.session_state.gstr1_data is not None and 
-        st.session_state.gstr3b_data is not None):
-        
-        # Apply mappings
-        mapped_invoices = apply_mapping(
-            st.session_state.invoice_data, 
-            st.session_state.mapping_config.get('invoice_data', {})
-        )
-        mapped_gstr1 = apply_mapping(
-            st.session_state.gstr1_data, 
-            st.session_state.mapping_config.get('gstr1_data', {})
-        )
-        mapped_gstr3b = apply_mapping(
-            st.session_state.gstr3b_data, 
-            st.session_state.mapping_config.get('gstr3b_data', {})
-        )
-        
-        # Run audits
-        mismatched = find_mismatched_invoices(mapped_invoices, mapped_gstr1)
-        duplicates = find_duplicate_invoices(mapped_invoices)
-        late_fees = calculate_late_fees(mapped_gstr3b)
-        
-        # Store results
-        st.session_state.audit_results = {
-            'mismatched': mismatched,
-            'duplicates': duplicates,
-            'late_fees': late_fees,
-            'summary': {
-                'total_invoices': len(mapped_invoices) if mapped_invoices is not None else 0,
-                'mismatched_count': len(mismatched),
-                'duplicates_count': len(duplicates),
-                'total_late_fees': late_fees['late_fee'].sum() if not late_fees.empty else 0
-            }
-        }
-        
-        st.success("Audit completed successfully!")
-        
-        # Show summary
-        st.subheader("📊 Audit Summary")
-        col1, col2, col3, col4 = st.columns(4)
-        col1.metric("Total Invoices", st.session_state.audit_results['summary']['total_invoices'])
-        col2.metric("Mismatched", st.session_state.audit_results['summary']['mismatched_count'])
-        col3.metric("Duplicates", st.session_state.audit_results['summary']['duplicates_count'])
-        col4.metric("Total Late Fees", f"₹{st.session_state.audit_results['summary']['total_late_fees']:,.2f}")
-        
-        # Show details
-        if not mismatched.empty:
-            with st.expander("🔍 Mismatched Invoices (not in GSTR-1)"):
-                st.dataframe(mismatched)
-        
-        if not duplicates.empty:
-            with st.expander("⚠️ Duplicate Invoices"):
-                st.dataframe(duplicates)
-        
-        if not late_fees.empty:
-            with st.expander("⏰ Late Filing Details"):
-                st.dataframe(late_fees)
+sales_map = show_map_ui(sales_df_raw, "Sales / Invoices", {
+    "invoice_no":["invoice","invoice_no","billno","bill_number","invno","inv_no"],
+    "date":["date","invoice_date","bill_date","created_date"],
+    "customer_gstin":["gstin","customer_gstin","buyer_gstin","gst_no"],
+    "taxable_value":["taxable_value","taxable","value","amount","net_amount"],
+    "igst":["igst"],
+    "cgst":["cgst"],
+    "sgst":["sgst"]
+})
+gstr1_map = show_map_ui(gstr1_df_raw, "GSTR-1", {
+    "invoice_no":["invoice","invoice_no","invno","inv_no"],
+    "date":["date","invoice_date"],
+    "taxable_value":["taxable_value","taxable","value"]
+})
+gstr3b_map = show_map_ui(gstr3b_df_raw, "GSTR-3B", {
+    "month":["month","period","tax_period"],
+    "filing_date":["filing_date","date_of_filing","filed_on","filingdate"],
+    "total_tax_paid":["total_tax_paid","tax_paid","total_tax"]
+})
+
+def materialize(df_raw, mapping):
+    if df_raw is None or mapping is None:
+        return None
+    df = df_raw.copy()
+    rename_map = {}
+    for standard, colname in mapping.items():
+        if colname and colname in df.columns:
+            rename_map[colname] = standard
+    df = df.rename(columns=rename_map)
+    if 'date' in df.columns:
+        df['date'] = parse_date_series(df['date'])
+    if 'filing_date' in df.columns:
+        df['filing_date'] = parse_date_series(df['filing_date'])
+    for ncol in ['taxable_value','igst','cgst','sgst','total_tax_paid']:
+        if ncol in df.columns:
+            df[ncol] = df[ncol].apply(to_num)
+    return df
+
+sales_df = materialize(sales_df_raw, sales_map)
+gstr1_df = materialize(gstr1_df_raw, gstr1_map)
+gstr3b_df = materialize(gstr3b_df_raw, gstr3b_map)
+
+# -----------------------
+# Main Audit Logic
+# -----------------------
+st.header("Run Audit Checks")
+late_fee_per_day = st.number_input("Late fee per day (prototype estimate)", value=50, step=10)
+
+if st.button("Run Audit"):
+    if sales_df is None:
+        st.error("Please upload and map your Sales/Invoices file.")
     else:
-        st.error("Please upload all required files or use sample data")
+        st.success("Running checks...")
+        # Ensure gstr1 exists (can be None)
+        if gstr1_df is None:
+            gstr1_df = pd.DataFrame(columns=[])
+        # 1) MISMATCH
+        if 'invoice_no' in sales_df.columns:
+            merged = sales_df.merge(gstr1_df[['invoice_no','taxable_value']].rename(columns={'taxable_value':'gstr1_taxable'}), on='invoice_no', how='left')
+        else:
+            # fallback: no invoice_no — attempt to match by date+amount+customer
+            merged = sales_df.copy()
+            merged['gstr1_taxable'] = pd.NA
+        # numeric ensure
+        merged['taxable_value'] = merged.get('taxable_value', pd.Series([0]*len(merged))).apply(to_num)
+        merged['gstr1_taxable'] = merged.get('gstr1_taxable', pd.Series([pd.NA]*len(merged))).apply(lambda x: to_num(x) if not pd.isna(x) else pd.NA)
+        merged['diff'] = (merged['taxable_value'] - merged['gstr1_taxable']).abs()
+        merged['mismatch_flag'] = merged['gstr1_taxable'].isnull() | (merged['diff'] > 1.0)
+        mismatches = merged[merged['mismatch_flag']].copy().fillna('')
+        st.subheader("Mismatched / Missing Invoices")
+        st.dataframe(mismatches.head(50))
 
-# PDF generation
-def create_pdf_report(results):
-    buffer = io.BytesIO()
-    doc = SimpleDocTemplate(buffer, pagesize=letter)
-    styles = getSampleStyleSheet()
-    story = []
-    
-    # Title
-    title_style = ParagraphStyle(
-        'CustomTitle',
-        parent=styles['Heading1'],
-        fontSize=16,
-        spaceAfter=30
-    )
-    story.append(Paragraph("AnchorComply Compliance Audit Report", title_style))
-    story.append(Spacer(1, 12))
-    
-    # Summary
-    story.append(Paragraph("Summary", styles['Heading2']))
-    summary_data = [
-        ['Metric', 'Value'],
-        ['Total Invoices', str(results['summary']['total_invoices'])],
-        ['Mismatched Invoices', str(results['summary']['mismatched_count'])],
-        ['Duplicate Invoices', str(results['summary']['duplicates_count'])],
-        ['Total Late Fees', f"₹{results['summary']['total_late_fees']:,.2f}"]
-    ]
-    
-    summary_table = Table(summary_data)
-    summary_table.setStyle(TableStyle([
-        ('BACKGROUND', (0, 0), (-1, 0), colors.grey),
-        ('TEXTCOLOR', (0, 0), (-1, 0), colors.whitesmoke),
-        ('ALIGN', (0, 0), (-1, -1), 'CENTER'),
-        ('FONTNAME', (0, 0), (-1, 0), 'Helvetica-Bold'),
-        ('FONTSIZE', (0, 0), (-1, 0), 12),
-        ('BOTTOMPADDING', (0, 0), (-1, 0), 12),
-        ('BACKGROUND', (0, 1), (-1, -1), colors.beige),
-        ('GRID', (0, 0), (-1, -1), 1, colors.black)
-    ]))
-    story.append(summary_table)
-    story.append(Spacer(1, 20))
-    
-    # Details
-    if not results['mismatched'].empty:
-        story.append(PageBreak())
-        story.append(Paragraph("Mismatched Invoices", styles['Heading2']))
-        mismatched_data = [list(results['mismatched'].columns)] + results['mismatched'].values.tolist()
-        mismatched_table = Table(mismatched_data)
-        mismatched_table.setStyle(TableStyle([
-            ('BACKGROUND', (0, 0), (-1, 0), colors.grey),
-            ('TEXTCOLOR', (0, 0), (-1, 0), colors.whitesmoke),
-            ('ALIGN', (0, 0), (-1, -1), 'CENTER'),
-            ('FONTNAME', (0, 0), (-1, 0), 'Helvetica-Bold'),
-            ('FONTSIZE', (0, 0), (-1, 0), 10),
-            ('BOTTOMPADDING', (0, 0), (-1, 0), 12),
-            ('BACKGROUND', (0, 1), (-1, -1), colors.beige),
-            ('FONTSIZE', (0, 1), (-1, -1), 8),
-            ('GRID', (0, 0), (-1, -1), 1, colors.black)
-        ]))
-        story.append(mismatched_table)
-    
-    doc.build(story)
-    buffer.seek(0)
-    return buffer
+        # 2) DUPLICATES
+        dup_by_no = pd.DataFrame()
+        dup_by_combo = pd.DataFrame()
+        if 'invoice_no' in sales_df.columns:
+            dup_by_no = sales_df[sales_df.duplicated(subset=['invoice_no'], keep=False)].copy()
+        # combo duplicates
+        combo_cols = [c for c in ['taxable_value','date','customer_gstin'] if c in sales_df.columns]
+        if combo_cols:
+            dup_by_combo = sales_df[sales_df.duplicated(subset=combo_cols, keep=False)].copy()
+        st.subheader("Possible Duplicates")
+        if not dup_by_no.empty:
+            st.markdown("**Duplicate invoice numbers**")
+            st.dataframe(dup_by_no)
+        if not dup_by_combo.empty:
+            st.markdown("**Possible duplicate entries (amount + date + customer)**")
+            st.dataframe(dup_by_combo)
+        if dup_by_no.empty and dup_by_combo.empty:
+            st.write("No obvious duplicates found in uploaded invoices.")
 
-# Download PDF button
-if 'audit_results' in st.session_state:
-    st.subheader("📄 Download Report")
-    pdf_buffer = create_pdf_report(st.session_state.audit_results)
-    
-    st.download_button(
-        label="Download PDF Report",
-        data=pdf_buffer,
-        file_name=f"compliance_audit_{datetime.now().strftime('%Y%m%d_%H%M%S')}.pdf",
-        mime="application/pdf"
-    )
+        # 3) DELAYED FILINGS
+        late_rows = []
+        if gstr3b_df is not None and not gstr3b_df.empty:
+            for idx, row in gstr3b_df.iterrows():
+                try:
+                    m = row.get('month', None)
+                    if isinstance(m, str) and len(m) >= 7:
+                        due = datetime.strptime(m + "-20", "%Y-%m-%d").date()
+                    else:
+                        due = None
+                    filed = row.get('filing_date', None)
+                    if pd.isna(filed):
+                        filed = None
+                    if isinstance(filed, pd.Timestamp):
+                        filed = filed.date()
+                    if due and filed:
+                        days_late = (filed - due).days
+                        if days_late > 0:
+                            late_rows.append({
+                                'month': row.get('month'),
+                                'due_date': due,
+                                'filing_date': filed,
+                                'days_late': days_late,
+                                'estimated_fee': int(days_late * late_fee_per_day)
+                            })
+                except Exception:
+                    continue
+        st.subheader("Delayed Filings & Estimated Late Fees")
+        if late_rows:
+            lf_df = pd.DataFrame(late_rows)
+            st.dataframe(lf_df)
+        else:
+            st.write("No delayed filings found in provided GSTR-3B file.")
 
-# Help section
-with st.sidebar.expander("ℹ️ Help & Instructions"):
+        # Summary
+        total_potential_penalty = sum([r['estimated_fee'] for r in late_rows]) if late_rows else 0
+        st.markdown("---")
+        st.subheader("Summary")
+        st.write(f"Total mismatches found: **{len(mismatches)}**")
+        st.write(f"Total duplicate records flagged: **{len(dup_by_no) + len(dup_by_combo)}**")
+        st.write(f"Estimated late filing fees (prototype calc): **₹{total_potential_penalty:,}**")
+
+        # -----------------------
+        # PDF generation with fpdf2
+        # -----------------------
+        def make_pdf_buffer(summary_text, mismatches_df, duplicates_df, late_df):
+            pdf = FPDF()
+            pdf.set_auto_page_break(auto=True, margin=15)
+            pdf.add_page()
+            pdf.set_font("Arial", "B", 14)
+            pdf.cell(0, 8, "AnchorComply — Audit Summary Report (Prototype)", ln=True)
+            pdf.ln(4)
+            pdf.set_font("Arial", size=11)
+            pdf.multi_cell(0, 6, summary_text)
+            pdf.ln(4)
+            if not mismatches_df.empty:
+                pdf.set_font("Arial", "B", 12)
+                pdf.cell(0, 6, "Mismatched / Missing Invoices (sample):", ln=True)
+                pdf.ln(2)
+                pdf.set_font("Courier", size=9)
+                for i, row in mismatches_df.head(10).iterrows():
+                    inv = str(row.get('invoice_no',''))
+                    dt = str(row.get('date',''))
+                    salesv = str(row.get('taxable_value',''))
+                    gstrv = str(row.get('gstr1_taxable',''))
+                    diffv = str(row.get('diff',''))
+                    line = f"{inv} | {dt} | Sales:{salesv} | GSTR1:{gstrv} | Diff:{diffv}"
+                    pdf.multi_cell(0, 5, line)
+                pdf.ln(4)
+            if not duplicates_df.empty:
+                pdf.set_font("Arial", "B", 12)
+                pdf.cell(0, 6, "Duplicate entries (sample):", ln=True)
+                pdf.ln(2)
+                pdf.set_font("Courier", size=9)
+                for i, row in duplicates_df.head(10).iterrows():
+                    inv = str(row.get('invoice_no',''))
+                    dt = str(row.get('date',''))
+                    amt = str(row.get('taxable_value',''))
+                    cust = str(row.get('customer_gstin',''))
+                    line = f"{inv} | {dt} | {amt} | {cust}"
+                    pdf.multi_cell(0, 5, line)
+                pdf.ln(4)
+            if late_df is not None and not late_df.empty:
+                pdf.set_font("Arial", "B", 12)
+                pdf.cell(0, 6, "Delayed Filings (sample):", ln=True)
+                pdf.ln(2)
+                pdf.set_font("Courier", size=9)
+                for i, row in late_df.head(10).iterrows():
+                    line = f"{row.month} | Filed: {row.filing_date} | Days late: {row.days_late} | Fee: ₹{row.estimated_fee}"
+                    pdf.multi_cell(0, 5, line)
+                pdf.ln(4)
+            pdf.set_font("Arial", size=10)
+            pdf.multi_cell(0, 6, "Action: Reconcile mismatched invoices with GSTR-1, correct duplicates, and ensure timely filings to avoid penalties.")
+            pdf.ln(6)
+            pdf.set_font("Arial", size=8)
+            pdf.multi_cell(0, 5, "Confidential: This report is a prototype estimate. For final compliance work consult your CA.")
+            # output bytes
+            buf = BytesIO()
+            buf.write(pdf.output(dest='S').encode('latin-1'))
+            buf.seek(0)
+            return buf
+
+        pdf_buf = make_pdf_buffer(f"AnchorComply Prototype report: {len(mismatches)} mismatches, {len(dup_by_no)+len(dup_by_combo)} duplicates, estimated fees ₹{total_potential_penalty:,}.", mismatches, pd.concat([dup_by_no, dup_by_combo]).drop_duplicates() if (not dup_by_no.empty or not dup_by_combo.empty) else pd.DataFrame(), pd.DataFrame(late_rows))
+        st.download_button("Download PDF Report", data=pdf_buf, file_name="anchorcomply_report.pdf", mime="application/pdf")
+
+# -----------------------
+# Help / Import Guide
+# -----------------------
+with st.expander("📖 Help & Import Guide"):
     st.markdown("""
-    **Supported Files:**
-    - CSV or XLSX files
-    - Invoice data, GSTR-1, and GSTR-3B exports
-    
-    **Required Columns:**
-    - Invoices: invoice_no, invoice_date, customer_gstin, taxable_value, total_amount
-    - GSTR-1: invoice_number, invoice_date, gstin, taxable_value, total_value
-    - GSTR-3B: month, gstin, tax_paid, filing_date
-    
-    **Sample Data:**
-    Click "Use Sample Data" to test with sample records.
-    
-    **Mapping:**
-    Map your CSV columns to expected format if auto-detection fails.
-    """)
+    ### AnchorComply — Audit & Import Guide
 
-# Footer
-st.sidebar.markdown("---")
-st.sidebar.markdown("**AnchorComply Prototype** v1.0")
+    **CSV Templates (required headers):**
+
+    **A) sales_invoices.csv**
+    ```
+    invoice_no,date,customer_gstin,taxable_value,igst,cgst,sgst,hsn,place_of_supply
+    ```
+    - `date`: YYYY-MM-DD  
+    - `taxable_value, igst, cgst, sgst`: numbers only  
+    - `customer_gstin`: GSTIN of buyer  
+
+    **B) gstr1.csv**
+    ```
+    invoice_no,date,customer_gstin,taxable_value,igst,cgst,sgst
+    ```
+
+    **C) gstr3b.csv**
+    ```
+    month,return_type,filing_date,total_outward_taxable_value,total_tax_paid
+    ```
+
+    ---
+
+    ### Audit Logic (prototype)
+    - **Invoice mismatch**: flags invoices missing or differing between sales vs GSTR-1.  
+    - **Duplicates**: flags duplicate invoice numbers or same-date+amount+customer combos.  
+    - **Delayed filings**: prototype assumes due = 20th of next month; compares to filing_date and estimates a fee.
+
+    """)
